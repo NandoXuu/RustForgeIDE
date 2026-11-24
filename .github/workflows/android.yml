@@ -41,9 +41,10 @@ jobs:
           exec > >(tee -a "$GITHUB_WORKSPACE/bootstrap-build.log") 2>&1
           sudo apt-get update
           sudo apt-get install -y \
-            git docker.io python3 python3-pip zip unzip file \
+            git python3 python3-pip zip unzip file \
             curl wget jq rsync xz-utils bzip2 tar
           sudo systemctl start docker
+          sudo docker info
           docker --version
           git --version
           python3 --version
