@@ -65,7 +65,9 @@ jobs:
         run: |
           set -euxo pipefail
           exec > >(tee -a "$GITHUB_WORKSPACE/bootstrap-build.log") 2>&1
+          set +o pipefail
           yes | sdkmanager --licenses
+          set -o pipefail
           sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
       - name: Set up Gradle 8.9
