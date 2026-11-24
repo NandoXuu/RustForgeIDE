@@ -139,14 +139,18 @@ jobs:
 
           replacement = (
               '\t# RustForge CI: não utilizar montagem FUSE.\n'
-              '\trm -rf "${TERMUX_STANDALONE_TOOLCHAIN}" \\\n'
-              '\t    "${TERMUX_STANDALONE_TOOLCHAIN}-upper" \\\n'
-              '\t    "${TERMUX_STANDALONE_TOOLCHAIN}-work"\n'
-              '\tmkdir -p "${TERMUX_STANDALONE_TOOLCHAIN}"\n'
-              '\tcp -a "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/." \\\n'
-              '\t    "${TERMUX_STANDALONE_TOOLCHAIN}/"\n'
-              '\tcp "${NDK}/source.properties" \\\n'
-              '\t    "${TERMUX_STANDALONE_TOOLCHAIN}/"'
+              '\t# Copia o NDK uma única vez: o marcador .termux-standalone-toolchain\n'
+              '\t# (criado no fim do setup) permite que as próximas chamadas reaproveitem.\n'
+              '\tif [ ! -f "${TERMUX_STANDALONE_TOOLCHAIN}/.termux-standalone-toolchain" ]; then\n'
+              '\t\trm -rf "${TERMUX_STANDALONE_TOOLCHAIN}" \\\n'
+              '\t\t\t"${TERMUX_STANDALONE_TOOLCHAIN}-upper" \\\n'
+              '\t\t\t"${TERMUX_STANDALONE_TOOLCHAIN}-work"\n'
+              '\t\tmkdir -p "${TERMUX_STANDALONE_TOOLCHAIN}"\n'
+              '\t\tcp -a "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/." \\\n'
+              '\t\t\t"${TERMUX_STANDALONE_TOOLCHAIN}/"\n'
+              '\t\tcp "${NDK}/source.properties" \\\n'
+              '\t\t\t"${TERMUX_STANDALONE_TOOLCHAIN}/"\n'
+              '\tfi'
           )
 
           patched = []
