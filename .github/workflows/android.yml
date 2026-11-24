@@ -1,0 +1,209 @@
+name: RustForge Android AArch64
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "app/**"
+      - "scripts/**"
+      - ".github/workflows/android.yml"
+      - "*.gradle.kts"
+      - "settings.gradle.kts"
+
+permissions:
+  contents: read
+
+env:
+  TERMUX_PACKAGES_REPOSITORY: https://github.com/termux/termux-packages.git
+  TERMUX_PACKAGES_REF: master
+  RUSTFORGE_APP_ID: com.ndx.rustforge.ide
+
+jobs:
+  build:
+    name: Build custom Linux bootstrap and RustForge APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout RustForge IDE
+        uses: actions/checkout@v4
+
+      - name: Initialize build log
+        shell: bash
+        run: |
+          : > "$GITHUB_WORKSPACE/bootstrap-build.log"
+          echo "RustForge Android AArch64 build started" >> "$GITHUB_WORKSPACE/bootstrap-build.log"
+
+      - name: Install host build tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/bootstrap-build.log") 2>&1
+          sudo apt-get update
+          sudo apt-get install -y \
+            git docker.io python3 python3-pip zip unzip file \
+            curl wget jq rsync xz-utils bzip2 tar
+          sudo systemctl start docker
+          docker --version
+          git --version
+          python3 --version
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform required by RustForge IDE
+        shell: bash
+        run: |
+          set -euxo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/bootstrap-build.log") 2>&1
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Clone official termux-packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none "$TERMUX_PACKAGES_REPOSITORY" termux-packages
+          git -C termux-packages checkout "$TERMUX_PACKAGES_REF"
+          echo "TERMUX_PACKAGES_COMMIT=$(git -C termux-packages rev-parse HEAD)" >> "$GITHUB_ENV"
+          git -C termux-packages log -1 --oneline | tee -a "$GITHUB_WORKSPACE/bootstrap-build.log"
+          echo "termux-packages commit: $(git -C termux-packages rev-parse HEAD)" >> "$GITHUB_WORKSPACE/bootstrap-build.log"
+
+      - name: Configure Termux package build for RustForge
+        working-directory: termux-packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/bootstrap-build.log") 2>&1
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          path = Path("scripts/properties.sh")
+          text = path.read_text()
+          assignments = {
+              "TERMUX__NAME": '"RustForge"',
+              "TERMUX_APP__PACKAGE_NAME": '"com.ndx.rustforge.ide"',
+              "TERMUX__PROJECT_SUBDIR": '"rustforge"',
+              "TERMUX_APP__APP_IDENTIFIER": '"rustforge"',
+              "TERMUX_APP__NAMESPACE": '"com.ndx.rustforge.ide"',
+              "TERMUX_API_APP__PACKAGE_NAME": '"com.ndx.rustforge.ide.api"',
+              "TERMUX_API_APP__APP_IDENTIFIER": '"rfapi"',
+              "TERMUX_API_APP__NAMESPACE": '"com.ndx.rustforge.ide.api"',
+          }
+          for variable, value in assignments.items():
+              pattern = rf'(?m)^{variable}=.*$'
+              updated, count = re.subn(pattern, f"{variable}={value}", text)
+              if count != 1:
+                  raise SystemExit(
+                      f"Expected exactly one {variable} assignment; got {count}"
+                  )
+              text = updated
+          path.write_text(text)
+          PY
+          bash -c 'source scripts/properties.sh; test "$TERMUX_APP__PACKAGE_NAME" = "com.ndx.rustforge.ide"; test "$TERMUX_APP__NAMESPACE" = "com.ndx.rustforge.ide"; test "$TERMUX__PREFIX" = "/data/data/com.ndx.rustforge.ide/files/usr"; test "$TERMUX__HOME" = "/data/data/com.ndx.rustforge.ide/files/home"; printf "APP=%s\\nNAMESPACE=%s\\nPREFIX=%s\\nHOME=%s\\n" "$TERMUX_APP__PACKAGE_NAME" "$TERMUX_APP__NAMESPACE" "$TERMUX__PREFIX" "$TERMUX__HOME"' | tee -a "$GITHUB_WORKSPACE/bootstrap-build.log"
+
+      - name: Prepare official Termux build host and Android NDK
+        working-directory: termux-packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/bootstrap-build.log") 2>&1
+          ./scripts/setup-ubuntu.sh
+
+          mkdir -p "$HOME/lib"
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export NDK="$HOME/lib/android-ndk-r30"
+          ./scripts/setup-android-sdk.sh
+
+          test -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" || \
+            find "$ANDROID_HOME" -type f -name sdkmanager -print -quit | grep -q .
+          test -d "$NDK"
+
+      - name: Build custom AArch64 bootstrap from package sources
+        working-directory: termux-packages
+        shell: bash
+        env:
+          TERMUX_DOCKER_USE_SUDO: "1"
+        run: |
+          set -euxo pipefail
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export NDK="$HOME/lib/android-ndk-r30"
+          export TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume ${ANDROID_HOME}:/home/builder/lib/android-sdk --volume ${NDK}:/home/builder/lib/android-ndk-r30 --env ANDROID_HOME=/home/builder/lib/android-sdk --env NDK=/home/builder/lib/android-ndk-r30"
+          {
+            echo "RustForge package build"
+            echo "termux-packages commit: $TERMUX_PACKAGES_COMMIT"
+            echo "applicationId: $RUSTFORGE_APP_ID"
+            echo "target architecture: aarch64"
+            echo "target prefix: /data/data/$RUSTFORGE_APP_ID/files/usr"
+            echo "target home: /data/data/$RUSTFORGE_APP_ID/files/home"
+            echo "packages: bash/apt/dpkg (bootstrap core), rust, git, cmake, ninja, clang, make, pkg-config, ca-certificates"
+            ./scripts/run-docker.sh ./scripts/build-bootstraps.sh \
+              --architectures aarch64 \
+              --add git,cmake,ninja,clang,make,pkg-config,ca-certificates,rust \
+              -f
+          } 2>&1 | tee -a "$GITHUB_WORKSPACE/bootstrap-build.log"
+
+          test -s bootstrap-aarch64.zip
+          cp bootstrap-aarch64.zip "$GITHUB_WORKSPACE/bootstrap-aarch64-upstream.zip"
+
+      - name: Prepare and validate RustForge bootstrap archive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 scripts/prepare-rustforge-bootstrap.py \
+            --input bootstrap-aarch64-upstream.zip \
+            --output bootstrap-aarch64.zip \
+            2>&1 | tee -a bootstrap-build.log
+          mkdir -p app/src/main/assets
+          install -m 0644 bootstrap-aarch64.zip app/src/main/assets/bootstrap-aarch64.zip
+          unzip -t app/src/main/assets/bootstrap-aarch64.zip | tail -n 2
+          test -s app/src/main/assets/bootstrap-aarch64.zip
+
+      - name: Build RustForge debug APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          grep -Eq 'targetSdk[[:space:]]*=[[:space:]]*28' app/build.gradle.kts
+          gradle --version 2>&1 | tee -a "$GITHUB_WORKSPACE/bootstrap-build.log"
+          gradle --no-daemon clean :app:assembleDebug 2>&1 | tee -a "$GITHUB_WORKSPACE/bootstrap-build.log"
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+      
+      - name: Collect generated files
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p artifact
+          if [ -s app/build/outputs/apk/debug/app-debug.apk ]; then
+            cp app/build/outputs/apk/debug/app-debug.apk artifact/app-debug.apk
+          fi
+          if [ -s app/src/main/assets/bootstrap-aarch64.zip ]; then
+            cp app/src/main/assets/bootstrap-aarch64.zip artifact/bootstrap-aarch64.zip
+          fi
+          if [ -s bootstrap-build.log ]; then
+            cp bootstrap-build.log artifact/bootstrap-build.log
+          fi
+
+      - name: Upload RustForge Android AArch64 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustforge-android-aarch64
+          path: |
+            artifact/app-debug.apk
+            artifact/bootstrap-aarch64.zip
+            artifact/bootstrap-build.log
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 14
