@@ -85,40 +85,106 @@ jobs:
           git -C termux-packages log -1 --oneline | tee -a "$GITHUB_WORKSPACE/bootstrap-build.log"
           echo "termux-packages commit: $(git -C termux-packages rev-parse HEAD)" >> "$GITHUB_WORKSPACE/bootstrap-build.log"
 
-      - name: Use Docker default AppArmor profile
+      - name: Disable FUSE overlay for GitHub Actions
         working-directory: termux-packages
         shell: bash
         run: |
           set -euxo pipefail
-          python3 - <<'PY_PATCH'
+
+          python3 - <<'PATCH'
           from pathlib import Path
+          import re
 
-          p = Path("scripts/run-docker.sh")
-          s = p.read_text()
+          # 1. Corrigir os argumentos Docker.
+          docker_file = Path("scripts/run-docker.sh")
+          docker = docker_file.read_text()
 
-          old_sec = 'SEC_OPT=" --security-opt seccomp=$REPOROOT/scripts/profile.json --security-opt apparmor=_custom-termux-package-builder-$CONTAINER_NAME --cap-add CAP_SYS_ADMIN --device /dev/fuse"'
-
-          new_sec = 'SEC_OPT=" --security-opt seccomp=$REPOROOT/scripts/profile.json --cap-add CAP_SYS_ADMIN --device /dev/fuse"'
-
-          old_parser = 'if command -v apparmor_parser > /dev/null; then\n\tAPPARMOR_PARSER="apparmor_parser"\nfi'
-
-          if old_sec not in s:
-              raise SystemExit("SEC_OPT original não encontrado.")
-
-          if old_parser not in s:
-              raise SystemExit("Bloco AppArmor original não encontrado.")
-
-          s = s.replace(old_sec, new_sec, 1)
-
-          s = s.replace(
-              old_parser,
-              '# GitHub Actions: use Docker default AppArmor profile.\nAPPARMOR_PARSER=""',
-              1
+          pattern = re.compile(
+              r'(?m)^[ \t]*SEC_OPT=" --security-opt '
+              r'seccomp=\$REPOROOT/scripts/profile\.json[^"]*"$'
           )
 
-          p.write_text(s)
-          print("Compatibilidade AppArmor aplicada!")
-          PY_PATCH
+          docker, count = pattern.subn(
+              'SEC_OPT=" --security-opt seccomp=$REPOROOT/scripts/profile.json"',
+              docker,
+              count=1
+          )
+
+          if count != 1:
+              raise SystemExit("ERRO: configuração SEC_OPT não encontrada.")
+
+          marker = "load_apparmor_profile() {"
+          if marker not in docker:
+              raise SystemExit("ERRO: função AppArmor não encontrada.")
+
+          if 'APPARMOR_PARSER=""\n' + marker not in docker:
+              docker = docker.replace(
+                  marker,
+                  'APPARMOR_PARSER=""\n' + marker,
+                  1
+              )
+
+          docker_file.write_text(docker)
+
+          # 2. Remover a dependência de fuse-overlayfs.
+          directory = Path("scripts/build/toolchain")
+          files = sorted(directory.glob("termux_setup_toolchain_*.sh"))
+
+          pattern = re.compile(
+              r'(?ms)^[ \t]*if ! mountpoint -q '
+              r'"\$\{TERMUX_STANDALONE_TOOLCHAIN\}"; then\n'
+              r'[ \t]*fuse-overlayfs \\\n'
+              r'.*?^[ \t]*fi[ \t]*$'
+          )
+
+          replacement = (
+              '\t# RustForge CI: não utilizar montagem FUSE.\n'
+              '\trm -rf "${TERMUX_STANDALONE_TOOLCHAIN}" \\\n'
+              '\t    "${TERMUX_STANDALONE_TOOLCHAIN}-upper" \\\n'
+              '\t    "${TERMUX_STANDALONE_TOOLCHAIN}-work"\n'
+              '\tmkdir -p "${TERMUX_STANDALONE_TOOLCHAIN}"\n'
+              '\tcp -a "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/." \\\n'
+              '\t    "${TERMUX_STANDALONE_TOOLCHAIN}/"\n'
+              '\tcp "${NDK}/source.properties" \\\n'
+              '\t    "${TERMUX_STANDALONE_TOOLCHAIN}/"'
+          )
+
+          patched = []
+
+          for file in files:
+              source = file.read_text()
+
+              if "fuse-overlayfs" not in source:
+                  continue
+
+              updated, count = pattern.subn(
+                  replacement,
+                  source,
+                  count=1
+              )
+
+              if count == 1:
+                  file.write_text(updated)
+                  patched.append(file.name)
+
+          if not patched:
+              raise SystemExit(
+                  "ERRO: nenhuma toolchain com bloco FUSE compatível encontrada."
+              )
+
+          print("Docker corrigido.")
+          print("Toolchains corrigidas:", ", ".join(patched))
+          print("FUSE removido do processo de preparação do NDK.")
+          PATCH
+
+          bash -n scripts/run-docker.sh
+
+          if grep -q 'fuse-overlayfs' scripts/build/toolchain/termux_setup_toolchain_30.sh 2>/dev/null; then
+            echo "ERRO: FUSE ainda presente na toolchain 30."
+            exit 1
+          fi
+
+          echo "Correção de compatibilidade concluída."
 
       - name: Fix upstream build-bootstraps.sh force-clean bug
         working-directory: termux-packages
