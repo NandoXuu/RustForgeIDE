@@ -120,6 +120,37 @@ jobs:
           print("Compatibilidade AppArmor aplicada!")
           PY_PATCH
 
+      - name: Fix upstream build-bootstraps.sh force-clean bug
+        working-directory: termux-packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY_PATCH'
+          from pathlib import Path
+
+          # Upstream termux-packages references an undefined variable in
+          # scripts/build-bootstraps.sh:
+          #   rm -f "$TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH"/*
+          # It expands to "rm -f /*", which fails with "cannot remove '/bin'..."
+          # and aborts the bootstrap build (exit code 1) when -f is used.
+          p = Path("scripts/build-bootstraps.sh")
+          s = p.read_text()
+
+          broken = 'rm -f "$TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH"/*'
+          fixed = 'rm -f "${TERMUX_BUILT_PACKAGES_DIRECTORY:?}"/*'
+
+          if broken in s:
+              s = s.replace(broken, fixed)
+              p.write_text(s)
+              print("Corrigido: glob indefinido em build-bootstraps.sh")
+          else:
+              print("Trecho com bug nao encontrado (upstream ja corrigiu?); nada a fazer.")
+
+          if "TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH" in p.read_text():
+              raise SystemExit("Variavel indefinida ainda referenciada em build-bootstraps.sh")
+          PY_PATCH
+          bash -n scripts/build-bootstraps.sh
+
       - name: Configure Termux package build for RustForge
         working-directory: termux-packages
         shell: bash
@@ -190,8 +221,7 @@ jobs:
             echo "packages: bash/apt/dpkg (bootstrap core), rust, git, cmake, ninja, clang, make, pkg-config, ca-certificates"
             ./scripts/run-docker.sh ./scripts/build-bootstraps.sh \
               --architectures aarch64 \
-              --add git,cmake,ninja,clang,make,pkg-config,ca-certificates,rust \
-              -f
+              --add git,cmake,ninja,clang,make,pkg-config,ca-certificates,rust
           } 2>&1 | tee -a "$GITHUB_WORKSPACE/bootstrap-build.log"
 
           test -s bootstrap-aarch64.zip
