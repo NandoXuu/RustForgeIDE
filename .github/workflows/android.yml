@@ -2,6 +2,11 @@ name: RustForge Android AArch64
 
 on:
   workflow_dispatch:
+    inputs:
+      resume_from_run:
+        description: "ID de um run anterior cujo checkpoint do stage 1 sera reaproveitado (pula o stage 1)"
+        required: false
+        default: ""
   push:
     paths:
       - "app/**"
@@ -12,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   TERMUX_PACKAGES_REPOSITORY: https://github.com/termux/termux-packages.git
@@ -19,14 +25,31 @@ env:
   RUSTFORGE_APP_ID: com.ndx.rustforge.ide
 
 jobs:
-  build:
-    name: Build custom Linux bootstrap and RustForge APK
+  stage1:
+    name: "Stage 1 - base packages + clang/LLVM (saves checkpoint)"
+    if: ${{ github.event.inputs.resume_from_run == '' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 360
+    outputs:
+      ckpt: ${{ steps.ckpt_upload.outcome == 'success' && 'true' || '' }}
 
     steps:
       - name: Checkout RustForge IDE
         uses: actions/checkout@v4
+
+      - name: Free disk space on runner
+        shell: bash
+        run: |
+          set -x
+          df -h / || true
+          for d in /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/powershell \
+                   /usr/local/share/chromium /opt/microsoft /opt/google /usr/share/swift \
+                   /opt/hostedtoolcache/CodeQL /usr/local/graalvm /usr/local/lib/heroku /opt/az; do
+            [ -e "$d" ] && sudo rm -rf "$d" || true
+          done
+          sudo docker image prune -af || true
+          sudo apt-get clean || true
+          df -h / || true
 
       - name: Initialize build log
         shell: bash
@@ -42,7 +65,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git python3 python3-pip zip unzip file \
-            curl wget jq rsync xz-utils bzip2 tar
+            curl wget jq rsync xz-utils bzip2 tar zstd
           sudo systemctl start docker
           sudo docker info
           docker --version
@@ -69,11 +92,6 @@ jobs:
           yes | sdkmanager --licenses
           set -o pipefail
           sdkmanager "platforms;android-34" "build-tools;34.0.0"
-
-      - name: Set up Gradle 8.9
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.9"
 
       - name: Clone official termux-packages
         shell: bash
@@ -316,11 +334,426 @@ jobs:
             find "$ANDROID_HOME" -type f -name sdkmanager -print -quit | grep -q .
           test -d "$NDK"
 
+      - name: Build packages up to clang/LLVM (stage 1, without rust)
+        working-directory: termux-packages
+        shell: bash
+        env:
+          TERMUX_DOCKER_USE_SUDO: "1"
+        timeout-minutes: 330
+        run: |
+          set -euxo pipefail
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export NDK="$HOME/lib/android-ndk-r30"
+          export TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume ${ANDROID_HOME}:/home/builder/lib/android-sdk --volume ${NDK}:/home/builder/lib/android-ndk-r30 --env ANDROID_HOME=/home/builder/lib/android-sdk --env NDK=/home/builder/lib/android-ndk-r30"
+          {
+            echo "RustForge package build"
+            echo "termux-packages commit: $TERMUX_PACKAGES_COMMIT"
+            echo "applicationId: $RUSTFORGE_APP_ID"
+            echo "target architecture: aarch64"
+            echo "target prefix: /data/data/$RUSTFORGE_APP_ID/files/usr"
+            echo "target home: /data/data/$RUSTFORGE_APP_ID/files/home"
+            echo "packages: bash/apt/dpkg (bootstrap core), git, cmake, ninja, clang, make, pkg-config, ca-certificates"
+            ./scripts/run-docker.sh ./scripts/build-bootstraps.sh \
+              --architectures aarch64 \
+              --add git,cmake,ninja,clang,make,pkg-config,ca-certificates
+          } 2>&1 | tee -a "$GITHUB_WORKSPACE/bootstrap-build.log"
+
+
+      - name: Save checkpoint (container /data/data + built .deb files)
+        id: ckpt
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! sudo docker container inspect termux-package-builder >/dev/null 2>&1; then
+            echo "Container inexistente; nada para salvar."
+            exit 0
+          fi
+          mkdir -p checkpoint termux-packages/output
+          sudo docker exec -u root termux-package-builder tar --warning=no-file-changed -cpf - -C / data/data \
+            | zstd -T0 -3 -o checkpoint/data.tar.zst
+          tar --warning=no-file-changed -cpf - -C termux-packages output | zstd -T0 -3 -o checkpoint/output.tar.zst
+          echo "TERMUX_PACKAGES_COMMIT=$TERMUX_PACKAGES_COMMIT" > checkpoint/meta.env
+          ls -lh checkpoint
+          echo "saved=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload checkpoint artifact
+        id: ckpt_upload
+        if: always() && steps.ckpt.outputs.saved == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustforge-checkpoint
+          path: checkpoint/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 5
+
+      - name: Upload stage 1 log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustforge-log-stage1
+          path: bootstrap-build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  stage2:
+    name: "Stage 2 - rust + bootstrap + RustForge APK"
+    needs: stage1
+    if: ${{ always() && (github.event.inputs.resume_from_run != '' || needs.stage1.outputs.ckpt == 'true') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout RustForge IDE
+        uses: actions/checkout@v4
+
+      - name: Free disk space on runner
+        shell: bash
+        run: |
+          set -x
+          df -h / || true
+          for d in /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/powershell \
+                   /usr/local/share/chromium /opt/microsoft /opt/google /usr/share/swift \
+                   /opt/hostedtoolcache/CodeQL /usr/local/graalvm /usr/local/lib/heroku /opt/az; do
+            [ -e "$d" ] && sudo rm -rf "$d" || true
+          done
+          sudo docker image prune -af || true
+          sudo apt-get clean || true
+          df -h / || true
+
+      - name: Initialize build log
+        shell: bash
+        run: |
+          : > "$GITHUB_WORKSPACE/bootstrap-build.log"
+          echo "RustForge Android AArch64 build started" >> "$GITHUB_WORKSPACE/bootstrap-build.log"
+
+      - name: Install host build tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/bootstrap-build.log") 2>&1
+          sudo apt-get update
+          sudo apt-get install -y \
+            git python3 python3-pip zip unzip file \
+            curl wget jq rsync xz-utils bzip2 tar zstd
+          sudo systemctl start docker
+          sudo docker info
+          docker --version
+          git --version
+          python3 --version
+
+      - name: Download stage 1 checkpoint
+        uses: actions/download-artifact@v4
+        with:
+          name: rustforge-checkpoint
+          path: checkpoint
+          run-id: ${{ github.event.inputs.resume_from_run || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Read checkpoint metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -lh checkpoint
+          source checkpoint/meta.env
+          test -n "$TERMUX_PACKAGES_COMMIT"
+          echo "TERMUX_PACKAGES_PIN=$TERMUX_PACKAGES_COMMIT" >> "$GITHUB_ENV"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android platform required by RustForge IDE
+        shell: bash
+        run: |
+          set -euxo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/bootstrap-build.log") 2>&1
+          set +o pipefail
+          yes | sdkmanager --licenses
+          set -o pipefail
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Clone official termux-packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none "$TERMUX_PACKAGES_REPOSITORY" termux-packages
+          git -C termux-packages checkout "${TERMUX_PACKAGES_PIN:-$TERMUX_PACKAGES_REF}"
+          echo "TERMUX_PACKAGES_COMMIT=$(git -C termux-packages rev-parse HEAD)" >> "$GITHUB_ENV"
+          git -C termux-packages log -1 --oneline | tee -a "$GITHUB_WORKSPACE/bootstrap-build.log"
+          echo "termux-packages commit: $(git -C termux-packages rev-parse HEAD)" >> "$GITHUB_WORKSPACE/bootstrap-build.log"
+
+      - name: Disable FUSE overlay for GitHub Actions
+        working-directory: termux-packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PATCH'
+          from pathlib import Path
+          import re
+
+          # 1. Corrigir os argumentos Docker.
+          docker_file = Path("scripts/run-docker.sh")
+          docker = docker_file.read_text()
+
+          pattern = re.compile(
+              r'(?m)^[ \t]*SEC_OPT=" --security-opt '
+              r'seccomp=\$REPOROOT/scripts/profile\.json[^"]*"$'
+          )
+
+          docker, count = pattern.subn(
+              'SEC_OPT=" --security-opt seccomp=$REPOROOT/scripts/profile.json"',
+              docker,
+              count=1
+          )
+
+          if count != 1:
+              raise SystemExit("ERRO: configuração SEC_OPT não encontrada.")
+
+          marker = "load_apparmor_profile() {"
+          if marker not in docker:
+              raise SystemExit("ERRO: função AppArmor não encontrada.")
+
+          if 'APPARMOR_PARSER=""\n' + marker not in docker:
+              docker = docker.replace(
+                  marker,
+                  'APPARMOR_PARSER=""\n' + marker,
+                  1
+              )
+
+          docker_file.write_text(docker)
+
+          # 2. Remover a dependência de fuse-overlayfs.
+          directory = Path("scripts/build/toolchain")
+          files = sorted(directory.glob("termux_setup_toolchain_*.sh"))
+
+          pattern = re.compile(
+              r'(?ms)^[ \t]*if ! mountpoint -q '
+              r'"\$\{TERMUX_STANDALONE_TOOLCHAIN\}"; then\n'
+              r'[ \t]*fuse-overlayfs \\\n'
+              r'.*?^[ \t]*fi[ \t]*$'
+          )
+
+          replacement = (
+              '\t# RustForge CI: não utilizar montagem FUSE.\n'
+              '\t# Copia o NDK uma única vez: o marcador .termux-standalone-toolchain\n'
+              '\t# (criado no fim do setup) permite que as próximas chamadas reaproveitem.\n'
+              '\tif [ ! -f "${TERMUX_STANDALONE_TOOLCHAIN}/.termux-standalone-toolchain" ]; then\n'
+              '\t\trm -rf "${TERMUX_STANDALONE_TOOLCHAIN}" \\\n'
+              '\t\t\t"${TERMUX_STANDALONE_TOOLCHAIN}-upper" \\\n'
+              '\t\t\t"${TERMUX_STANDALONE_TOOLCHAIN}-work"\n'
+              '\t\tmkdir -p "${TERMUX_STANDALONE_TOOLCHAIN}"\n'
+              '\t\tcp -a "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/." \\\n'
+              '\t\t\t"${TERMUX_STANDALONE_TOOLCHAIN}/"\n'
+              '\t\tcp "${NDK}/source.properties" \\\n'
+              '\t\t\t"${TERMUX_STANDALONE_TOOLCHAIN}/"\n'
+              '\tfi'
+          )
+
+          patched = []
+
+          for file in files:
+              source = file.read_text()
+
+              if "fuse-overlayfs" not in source:
+                  continue
+
+              updated, count = pattern.subn(
+                  replacement,
+                  source,
+                  count=1
+              )
+
+              if count == 1:
+                  file.write_text(updated)
+                  patched.append(file.name)
+
+          if not patched:
+              raise SystemExit(
+                  "ERRO: nenhuma toolchain com bloco FUSE compatível encontrada."
+              )
+
+          print("Docker corrigido.")
+          print("Toolchains corrigidas:", ", ".join(patched))
+          print("FUSE removido do processo de preparação do NDK.")
+          PATCH
+
+          bash -n scripts/run-docker.sh
+
+          if grep -q 'fuse-overlayfs' scripts/build/toolchain/termux_setup_toolchain_30.sh 2>/dev/null; then
+            echo "ERRO: FUSE ainda presente na toolchain 30."
+            exit 1
+          fi
+
+          echo "Correção de compatibilidade concluída."
+
+      - name: Fix upstream build-bootstraps.sh force-clean bug
+        working-directory: termux-packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY_PATCH'
+          from pathlib import Path
+
+          # Upstream termux-packages references an undefined variable in
+          # scripts/build-bootstraps.sh:
+          #   rm -f "$TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH"/*
+          # It expands to "rm -f /*", which fails with "cannot remove '/bin'..."
+          # and aborts the bootstrap build (exit code 1) when -f is used.
+          p = Path("scripts/build-bootstraps.sh")
+          s = p.read_text()
+
+          broken = 'rm -f "$TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH"/*'
+          fixed = 'rm -f "${TERMUX_BUILT_PACKAGES_DIRECTORY:?}"/*'
+
+          if broken in s:
+              s = s.replace(broken, fixed)
+              p.write_text(s)
+              print("Corrigido: glob indefinido em build-bootstraps.sh")
+          else:
+              print("Trecho com bug nao encontrado (upstream ja corrigiu?); nada a fazer.")
+
+          if "TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH" in p.read_text():
+              raise SystemExit("Variavel indefinida ainda referenciada em build-bootstraps.sh")
+          PY_PATCH
+          bash -n scripts/build-bootstraps.sh
+
+      - name: Fix build-bootstraps.sh subpackage names (bzip2, clang)
+        working-directory: termux-packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY_PATCH'
+          from pathlib import Path
+
+          # build-bootstraps.sh builds every name in PACKAGES (and in --add)
+          # with build-package.sh, which only accepts packages that have their
+          # own build.sh. Some names are only subpackages of another package
+          # (bzip2 -> libbz2, clang -> libllvm) and fail with:
+          #   ERROR: No package bzip2 found in any of the enabled repositories.
+          # Resolve a subpackage name to its parent package before building it.
+          p = Path("scripts/build-bootstraps.sh")
+          s = p.read_text()
+
+          guard = "RustForge: subpacotes"
+          if guard in s:
+              print("Patch de subpacotes ja aplicado.")
+          else:
+              i = s.index("build_package() {")
+              marker = '\tlocal package_name="$2"\n'
+              j = s.index(marker, i)
+              inject = "\n".join([
+                  "\t# RustForge: subpacotes (bzip2 -> libbz2, clang -> libllvm) nao tem",
+                  "\t# build.sh proprio; compilar o pacote pai, que gera o .deb do subpacote.",
+                  '\tif [ ! -f "$TERMUX_PACKAGES_DIRECTORY/packages/$package_name/build.sh" ]; then',
+                  "\t\tlocal _subpkg_file",
+                  '\t\tfor _subpkg_file in "$TERMUX_PACKAGES_DIRECTORY"/packages/*/"$package_name".subpackage.sh; do',
+                  '\t\t\t[ -f "$_subpkg_file" ] || continue',
+                  '\t\t\tpackage_name="$(basename "$(dirname "$_subpkg_file")")"',
+                  "\t\t\tbreak",
+                  "\t\tdone",
+                  "\tfi",
+              ]) + "\n"
+              s = s[:j] + marker + inject + s[j + len(marker):]
+              p.write_text(s)
+              print("Corrigido: subpacotes resolvidos para o pacote pai em build_package()")
+
+          if guard not in p.read_text():
+              raise SystemExit("Patch de subpacotes nao foi aplicado")
+          PY_PATCH
+          bash -n scripts/build-bootstraps.sh
+
+      - name: Configure Termux package build for RustForge
+        working-directory: termux-packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/bootstrap-build.log") 2>&1
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          path = Path("scripts/properties.sh")
+          text = path.read_text()
+          assignments = {
+              "TERMUX__NAME": '"RustForge"',
+              "TERMUX_APP__PACKAGE_NAME": '"com.ndx.rustforge.ide"',
+              "TERMUX__PROJECT_SUBDIR": '"rustforge"',
+              "TERMUX_APP__APP_IDENTIFIER": '"rustforge"',
+              "TERMUX_APP__NAMESPACE": '"com.ndx.rustforge.ide"',
+              "TERMUX_API_APP__PACKAGE_NAME": '"com.ndx.rustforge.ide.api"',
+              "TERMUX_API_APP__APP_IDENTIFIER": '"rfapi"',
+              "TERMUX_API_APP__NAMESPACE": '"com.ndx.rustforge.ide.api"',
+          }
+          for variable, value in assignments.items():
+              pattern = rf'(?m)^{variable}=.*$'
+              updated, count = re.subn(pattern, f"{variable}={value}", text)
+              if count != 1:
+                  raise SystemExit(
+                      f"Expected exactly one {variable} assignment; got {count}"
+                  )
+              text = updated
+          path.write_text(text)
+          PY
+          bash -c 'source scripts/properties.sh; test "$TERMUX_APP__PACKAGE_NAME" = "com.ndx.rustforge.ide"; test "$TERMUX_APP__NAMESPACE" = "com.ndx.rustforge.ide"; test "$TERMUX__PREFIX" = "/data/data/com.ndx.rustforge.ide/files/usr"; test "$TERMUX__HOME" = "/data/data/com.ndx.rustforge.ide/files/home"; printf "APP=%s\\nNAMESPACE=%s\\nPREFIX=%s\\nHOME=%s\\n" "$TERMUX_APP__PACKAGE_NAME" "$TERMUX_APP__NAMESPACE" "$TERMUX__PREFIX" "$TERMUX__HOME"' | tee -a "$GITHUB_WORKSPACE/bootstrap-build.log"
+
+      - name: Prepare official Termux build host and Android NDK
+        working-directory: termux-packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/bootstrap-build.log") 2>&1
+          ./scripts/setup-ubuntu.sh
+
+          mkdir -p "$HOME/lib"
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export NDK="$HOME/lib/android-ndk-r30"
+          ./scripts/setup-android-sdk.sh
+
+          test -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" || \
+            find "$ANDROID_HOME" -type f -name sdkmanager -print -quit | grep -q .
+          test -d "$NDK"
+
+      - name: Restore stage 1 checkpoint into the builder container
+        working-directory: termux-packages
+        shell: bash
+        env:
+          TERMUX_DOCKER_USE_SUDO: "1"
+        run: |
+          set -euxo pipefail
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export NDK="$HOME/lib/android-ndk-r30"
+          export TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume ${ANDROID_HOME}:/home/builder/lib/android-sdk --volume ${NDK}:/home/builder/lib/android-ndk-r30 --env ANDROID_HOME=/home/builder/lib/android-sdk --env NDK=/home/builder/lib/android-ndk-r30"
+          # cria o container (mesmos volumes/argumentos do build) e roda um comando vazio
+          ./scripts/run-docker.sh true
+          # /data/data do container: prefixo instalado + marcadores de pacotes ja compilados
+          zstd -dc "$GITHUB_WORKSPACE/checkpoint/data.tar.zst" \
+            | sudo docker exec -i -u root termux-package-builder tar -xpf - -C /
+          # .deb ja gerados no stage 1
+          zstd -dc "$GITHUB_WORKSPACE/checkpoint/output.tar.zst" | tar -xpf - -C .
+          echo "pacotes marcados como compilados: $(sudo docker exec termux-package-builder sh -c 'ls /data/data/.built-packages | wc -l')"
+          echo ".deb restaurados: $(ls output/*.deb | wc -l)"
+          df -h /
+
       - name: Build custom AArch64 bootstrap from package sources
         working-directory: termux-packages
         shell: bash
         env:
           TERMUX_DOCKER_USE_SUDO: "1"
+        timeout-minutes: 315
         run: |
           set -euxo pipefail
           export ANDROID_HOME="$ANDROID_SDK_ROOT"
@@ -364,7 +797,7 @@ jobs:
           gradle --no-daemon clean :app:assembleDebug 2>&1 | tee -a "$GITHUB_WORKSPACE/bootstrap-build.log"
           APK="app/build/outputs/apk/debug/app-debug.apk"
           test -s "$APK"
-      
+
       - name: Collect generated files
         if: always()
         shell: bash
