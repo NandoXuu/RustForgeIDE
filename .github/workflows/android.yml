@@ -221,6 +221,51 @@ jobs:
           PY_PATCH
           bash -n scripts/build-bootstraps.sh
 
+      - name: Fix build-bootstraps.sh subpackage names (bzip2, clang)
+        working-directory: termux-packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY_PATCH'
+          from pathlib import Path
+
+          # build-bootstraps.sh builds every name in PACKAGES (and in --add)
+          # with build-package.sh, which only accepts packages that have their
+          # own build.sh. Some names are only subpackages of another package
+          # (bzip2 -> libbz2, clang -> libllvm) and fail with:
+          #   ERROR: No package bzip2 found in any of the enabled repositories.
+          # Resolve a subpackage name to its parent package before building it.
+          p = Path("scripts/build-bootstraps.sh")
+          s = p.read_text()
+
+          guard = "RustForge: subpacotes"
+          if guard in s:
+              print("Patch de subpacotes ja aplicado.")
+          else:
+              i = s.index("build_package() {")
+              marker = '\tlocal package_name="$2"\n'
+              j = s.index(marker, i)
+              inject = "\n".join([
+                  "\t# RustForge: subpacotes (bzip2 -> libbz2, clang -> libllvm) nao tem",
+                  "\t# build.sh proprio; compilar o pacote pai, que gera o .deb do subpacote.",
+                  '\tif [ ! -f "$TERMUX_PACKAGES_DIRECTORY/packages/$package_name/build.sh" ]; then',
+                  "\t\tlocal _subpkg_file",
+                  '\t\tfor _subpkg_file in "$TERMUX_PACKAGES_DIRECTORY"/packages/*/"$package_name".subpackage.sh; do',
+                  '\t\t\t[ -f "$_subpkg_file" ] || continue',
+                  '\t\t\tpackage_name="$(basename "$(dirname "$_subpkg_file")")"',
+                  "\t\t\tbreak",
+                  "\t\tdone",
+                  "\tfi",
+              ]) + "\n"
+              s = s[:j] + marker + inject + s[j + len(marker):]
+              p.write_text(s)
+              print("Corrigido: subpacotes resolvidos para o pacote pai em build_package()")
+
+          if guard not in p.read_text():
+              raise SystemExit("Patch de subpacotes nao foi aplicado")
+          PY_PATCH
+          bash -n scripts/build-bootstraps.sh
+
       - name: Configure Termux package build for RustForge
         working-directory: termux-packages
         shell: bash
